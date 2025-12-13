@@ -28,28 +28,16 @@ jobs:
         with:
           node-version: '24'
 
-      - name: 安装 Yarn
-        run: npm install -g yarn
-
-      - name: 构建前端
+      - name: 安装 Yarn 和 UPX
         run: |
-          cd web
-          yarn install
-          yarn build
-          cd ..
-
-      - name: 安装 UPX
-        run: |
+          npm install -g yarn
           sudo apt-get update
           sudo apt-get install -y upx
 
-      - name: 构建服务端二进制
+      - name: 使用 Make 构建前后端
         run: |
-          mkdir -p bin
           VERSION=${GITHUB_REF#refs/tags/}
-          LDFLAGS="-s -w -X main.Version=${VERSION}"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o bin/uart_sms_forwarder-linux-amd64 cmd/serv/main.go
-          upx bin/uart_sms_forwarder-linux-amd64
+          make build-release VERSION=${VERSION}
           ls -lh bin/
 
       - name: 准备发布包
