@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -28,15 +29,19 @@ const (
 	CacheTTL = 5 * time.Minute
 )
 
+type ScheduledTaskStatusUpdater func(ctx context.Context, msgID string, status models.LastRunStatus) error
+
 // SerialService 串口管理服务
 type SerialService struct {
-	logger          *zap.Logger
-	config          config.SerialConfig
-	port            serial.Port
-	textMsgService  *TextMessageService
-	notifier        *Notifier
-	propertyService *PropertyService
-	wg              sync.WaitGroup
+	logger                     *zap.Logger
+	config                     config.SerialConfig
+	port                       serial.Port
+	textMsgService             *TextMessageService
+	notifier                   *Notifier
+	propertyService            *PropertyService
+	handlers                   map[string]messageHandler
+	scheduledTaskStatusUpdater ScheduledTaskStatusUpdater
+	wg                         sync.WaitGroup
 	// 设备信息缓存
 	deviceCache cache.Cache[string, *StatusData]
 	// 连接状态管理
@@ -53,7 +58,7 @@ func NewSerialService(
 	notifier *Notifier,
 	propertyService *PropertyService,
 ) *SerialService {
-	return &SerialService{
+	service := &SerialService{
 		logger:          logger,
 		config:          config,
 		textMsgService:  textMsgService,
@@ -61,6 +66,12 @@ func NewSerialService(
 		propertyService: propertyService,
 		deviceCache:     cache.New[string, *StatusData](CacheTTL),
 	}
+	service.initMessageHandlers()
+	return service
+}
+
+func (s *SerialService) SetScheduledTaskStatusUpdater(updater ScheduledTaskStatusUpdater) {
+	s.scheduledTaskStatusUpdater = updater
 }
 
 // Start 启动串口服务（使用 backoff 重连机制）
@@ -240,7 +251,7 @@ func (s *SerialService) autoDetectPort(ports []string) (string, error) {
 
 		if err == nil && n > 0 {
 			response := string(buffer[:n])
-			if s.isValidResponse(response) {
+			if isValidResponse(response) {
 				s.logger.Debug("检测到可用串口", zap.String("port", portName))
 				return portName, nil
 			}
@@ -248,43 +259,6 @@ func (s *SerialService) autoDetectPort(ports []string) (string, error) {
 	}
 
 	return "", fmt.Errorf("未检测到可用串口")
-}
-
-// isValidResponse 检查响应是否有效
-func (s *SerialService) isValidResponse(response string) bool {
-	// 检查是否包含基本的JSON结构
-	if !strings.Contains(response, "{") || !strings.Contains(response, "}") {
-		return false
-	}
-
-	// 尝试解析JSON
-	var jsonData map[string]interface{}
-	if err := json.Unmarshal([]byte(response), &jsonData); err == nil {
-		if _, hasType := jsonData["type"]; hasType {
-			return true
-		}
-		if _, hasTimestamp := jsonData["timestamp"]; hasTimestamp {
-			return true
-		}
-		if len(jsonData) > 0 {
-			return true
-		}
-	}
-
-	// 检查是否包含Lua脚本的标准格式
-	if strings.Contains(response, "SMS_START:") && strings.Contains(response, ":SMS_END") {
-		return true
-	}
-
-	// 检查是否包含状态信息关键词
-	keywords := []string{"status_response", "mobile_info", "heartbeat", "system_ready"}
-	for _, keyword := range keywords {
-		if strings.Contains(response, keyword) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // listenSerialData 监听串口数据（在独立 goroutine 中运行）
@@ -365,264 +339,23 @@ func (s *SerialService) requestCacheUpdate() {
 	}
 }
 
-type StatusData struct {
-	CellularEnabled bool   `json:"cellular_enabled"`
-	Type            string `json:"type"`
-	Mobile          struct {
-		IsRegistered bool   `json:"is_registered"`
-		Iccid        string `json:"iccid"`
-		NetworkType  string `json:"network_type"`
-		SignalDesc   string `json:"signal_desc"`
-		SignalLevel  int    `json:"signal_level"`
-		SimReady     bool   `json:"sim_ready"`
-		Rssi         int    `json:"rssi"`
-		Imsi         string `json:"imsi"`
-		Operator     string `json:"operator"`
-	} `json:"mobile"`
-	Timestamp int    `json:"timestamp"`
-	MemKb     int    `json:"mem_kb"`
-	PortName  string `json:"port_name"` // 串口名称
-	Connected bool   `json:"connected"` // 连接状态
-}
-
 // processReceivedData 处理接收到的数据
 func (s *SerialService) processReceivedData(data string) {
 	s.logger.Sugar().Debugf("received data: %s", data)
-	// 解析Lua脚本发送的消息格式：SMS_START:{json}:SMS_END
-	if strings.HasPrefix(data, "SMS_START:") && strings.HasSuffix(data, ":SMS_END") {
-		// 提取JSON部分
-		jsonData := data[10 : len(data)-8]
-
-		// 先解析为通用map来判断消息类型
-		var msg map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonData), &msg); err != nil {
-			s.logger.Error("JSON解析失败", zap.Error(err), zap.String("data", jsonData))
-			return
-		}
-
-		// 根据type字段处理不同类型的消息
-		msgType, ok := msg["type"].(string)
-		if !ok {
-			s.logger.Warn("消息类型缺失", zap.String("data", jsonData))
-			return
-		}
-
-		switch msgType {
-		case "incoming_sms":
-			s.handleIncomingSMS(jsonData)
-		case "system_ready":
-			s.handleSystemReady(jsonData)
-		case "heartbeat":
-			s.handleHeartbeat(msg)
-		case "status_response":
-			// 直接更新缓存（status_response 包含完整的设备状态和 mobile 信息）
-			// 更新运营商
-			var statusData StatusData
-			if err := json.Unmarshal([]byte(jsonData), &statusData); err != nil {
-				s.logger.Error("JSON解析失败", zap.Error(err), zap.String("data", jsonData))
-				return
-			}
-			imsi := statusData.Mobile.Imsi
-			if len(imsi) > 5 {
-				plmn := imsi[:5]
-				statusData.Mobile.Operator = OperData[plmn]
-			}
-			s.deviceCache.Set(CacheKeyDeviceStatus, &statusData, CacheTTL)
-			s.logger.Debug("设备状态缓存已更新")
-		case "cellular_control_response":
-			s.logger.Debug("收到蜂窝网络控制响应", zap.Any("data", msg))
-		case "phone_number_response":
-			s.logger.Debug("收到电话号码响应", zap.Any("data", msg))
-		case "cmd_response":
-			// Lua 脚本中的命令响应
-			if action, ok := msg["action"].(string); ok {
-				s.logger.Info("命令响应", zap.String("action", action), zap.Any("result", msg["result"]))
-			}
-		case "sms_send_result":
-			// 短信发送结果
-			s.handleSMSSendResult(msg)
-		case "sim_event":
-			// SIM卡事件
-			status, _ := msg["status"].(string)
-			s.logger.Info("SIM卡事件", zap.String("status", status))
-		case "warning":
-			// 警告消息（如数据连接警告）
-			if warnMsg, ok := msg["msg"].(string); ok {
-				s.logger.Warn("设备警告", zap.String("message", warnMsg))
-			}
-		case "error":
-			// 错误消息
-			if errMsg, ok := msg["msg"].(string); ok {
-				s.logger.Error("设备错误", zap.String("message", errMsg))
-			}
-		default:
-			s.logger.Debug("未知消息类型", zap.String("type", msgType), zap.String("data", jsonData))
-		}
-	}
-}
-
-// IncomingSMS 接收的短信消息结构
-type IncomingSMS struct {
-	Timestamp int64  `json:"timestamp"`
-	From      string `json:"from"`
-	Content   string `json:"content"`
-	Type      string `json:"type"`
-}
-
-func (r IncomingSMS) String() string {
-	timestamp := time.Unix(r.Timestamp, 0)
-	message := fmt.Sprintf(`%s
-----
-来自: %s
-%s
-`,
-		r.Content,
-		r.From,
-		timestamp.Format(time.DateTime),
-	)
-	return message
-}
-
-// handleIncomingSMS 处理接收到的短信
-func (s *SerialService) handleIncomingSMS(jsonData string) {
-	var sms IncomingSMS
-	if err := json.Unmarshal([]byte(jsonData), &sms); err != nil {
-		s.logger.Error("短信消息解析失败", zap.Error(err))
-		return
-	}
-
-	s.logger.Info("收到新短信",
-		zap.String("from", sms.From),
-		zap.String("content", sms.Content),
-		zap.Int64("timestamp", sms.Timestamp))
-
-	// 保存短信记录
-	ctx := context.Background()
-	msg := &models.TextMessage{
-		ID:        uuid.NewString(),
-		From:      sms.From,
-		To:        "", // 接收方是本机
-		Content:   sms.Content,
-		Type:      models.MessageTypeIncoming,
-		Status:    models.MessageStatusReceived,
-		CreatedAt: time.Now().UnixMilli(),
-	}
-
-	if err := s.textMsgService.Save(ctx, msg); err != nil {
-		s.logger.Error("保存短信记录失败", zap.Error(err))
-	}
-
-	// 异步发送通知
-	go s.sendNotification(ctx, sms)
-}
-
-// sendNotification 发送通知
-func (s *SerialService) sendNotification(ctx context.Context, sms IncomingSMS) {
-	// 获取通知渠道配置
-	channels, err := s.propertyService.GetNotificationChannelConfigs(ctx)
+	msg, err := parseSMSFrame(data)
 	if err != nil {
-		s.logger.Error("获取通知渠道配置失败", zap.Error(err))
+		if errors.Is(err, errNotSMSFrame) {
+			return
+		}
+		if errors.Is(err, errMissingType) {
+			s.logger.Warn("消息类型缺失", zap.String("data", data))
+			return
+		}
+		s.logger.Error("解析串口消息失败", zap.Error(err), zap.String("data", data))
 		return
 	}
 
-	// 格式化消息
-	message := sms.String()
-
-	// 发送到所有启用的渠道
-	for _, channel := range channels {
-		if !channel.Enabled {
-			continue
-		}
-
-		var sendErr error
-		switch channel.Type {
-		case "dingtalk":
-			sendErr = s.notifier.SendDingTalkByConfig(ctx, channel.Config, message)
-		case "wecom":
-			sendErr = s.notifier.SendWeComByConfig(ctx, channel.Config, message)
-		case "feishu":
-			sendErr = s.notifier.SendFeishuByConfig(ctx, channel.Config, message)
-		case "webhook":
-			sendErr = s.notifier.SendWebhookByConfig(ctx, channel.Config, sms)
-		case "email":
-			sendErr = s.notifier.SendEmailBySMS(ctx, channel.Config, sms)
-		}
-
-		if sendErr != nil {
-			s.logger.Error("发送通知失败",
-				zap.String("type", channel.Type),
-				zap.Error(sendErr))
-		} else {
-			s.logger.Info("通知发送成功", zap.String("type", channel.Type))
-		}
-	}
-}
-
-// handleSystemReady 处理系统就绪消息
-func (s *SerialService) handleSystemReady(jsonData string) {
-	var msg map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonData), &msg); err != nil {
-		s.logger.Error("系统消息解析失败", zap.Error(err))
-		return
-	}
-
-	if message, ok := msg["message"].(string); ok {
-		s.logger.Info("系统就绪", zap.String("message", message))
-	}
-}
-
-// handleHeartbeat 处理心跳消息
-func (s *SerialService) handleHeartbeat(msg map[string]interface{}) {
-	timestamp, _ := msg["timestamp"].(float64)
-	memoryUsage, _ := msg["memory_usage"].(float64)
-	bufferSize, _ := msg["buffer_size"].(float64)
-
-	s.logger.Debug("设备心跳",
-		zap.Int64("timestamp", int64(timestamp)),
-		zap.Float64("memory_usage", memoryUsage),
-		zap.Int("buffer_size", int(bufferSize)))
-}
-
-// handleSMSSendResult 处理短信发送结果
-func (s *SerialService) handleSMSSendResult(msg map[string]interface{}) {
-	success, _ := msg["success"].(bool)
-	to, _ := msg["to"].(string)
-	requestID, _ := msg["request_id"].(string)
-
-	if requestID == "" {
-		s.logger.Warn("收到短信发送结果但缺少 request_id", zap.Any("msg", msg))
-		return
-	}
-
-	// 从数据库获取消息记录
-	ctx := context.Background()
-	var status models.MessageStatus
-	// 更新状态
-	if success {
-		status = models.MessageStatusSent
-		s.logger.Info("短信发送成功",
-			zap.String("to", to),
-			zap.String("request_id", requestID))
-	} else {
-		status = models.MessageStatusFailed
-		s.logger.Warn("短信发送失败",
-			zap.String("to", to),
-			zap.String("request_id", requestID))
-		// 发送通知
-		go s.sendNotification(context.Background(), IncomingSMS{
-			From:    "system",
-			Content: fmt.Sprintf("短信发送失败: %s", to),
-		})
-	}
-
-	// 保存更新
-	if err := s.textMsgService.UpdateStatusById(ctx, requestID, status); err != nil {
-		s.logger.Error("更新短信状态失败",
-			zap.String("request_id", requestID),
-			zap.Error(err))
-	}
-
-	// todo 更新计划任务的执行状态
+	s.routeMessage(msg)
 }
 
 // SendSMS 发送短信
@@ -702,18 +435,16 @@ func (s *SerialService) sendJSONCommand(cmd any) error {
 		return fmt.Errorf("串口未连接")
 	}
 
-	jsonData, err := json.Marshal(cmd)
+	message, jsonData, err := buildCommandMessage(cmd)
 	if err != nil {
-		return fmt.Errorf("JSON编码失败: %w", err)
+		return err
 	}
 
-	// 使用 Lua 脚本定义的协议格式：CMD_START:{json}:CMD_END
-	message := fmt.Sprintf("CMD_START:%s:CMD_END\r\n", string(jsonData))
-	_, err = s.port.Write([]byte(message))
+	_, err = s.port.Write(message)
 	if err != nil {
 		return fmt.Errorf("串口写入失败: %w", err)
 	}
-	s.logger.Sugar().Debugf("send command: %v", string(jsonData))
+	s.logger.Sugar().Debugf("send command: %s", jsonData)
 
 	return nil
 }

@@ -211,3 +211,7 @@ func (s *SchedulerService) UpdateLastRun(ctx context.Context, id, msgId string, 
 		"last_run_status": status,
 	})
 }
+
+func (s *SchedulerService) UpdateLastRunStatusByMsgId(ctx context.Context, msgId string, status models.LastRunStatus) error {
+	return s.repo.UpdateLastRunStatusByMsgId(ctx, msgId, status)
+}

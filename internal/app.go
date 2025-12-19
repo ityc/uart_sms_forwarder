@@ -90,6 +90,7 @@ func setup(app *orz.App) error {
 		db,
 		serialService,
 	)
+	serialService.SetScheduledTaskStatusUpdater(schedulerService.UpdateLastRunStatusByMsgId)
 
 	// 8. 初始化 Handler
 	authHandler := handler.NewAuthHandler(logger, &appConfig)

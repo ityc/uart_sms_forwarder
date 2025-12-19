@@ -9,3 +9,4 @@ bin
 app.db
 config.yaml
 logs
+.DS_Store
