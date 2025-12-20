@@ -195,7 +195,6 @@ sys.subscribe("CC_IND", function(state)
         if call_ring_count > 3 then
             log.info("Call", "自动挂断来电")
             cc.hangUp()
-            call_ring_count = 0
         end
 
     elseif state == "DISCONNECTED" then
